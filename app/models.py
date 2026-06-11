@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 class TaskStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
+    PAUSED = "paused"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -62,6 +63,8 @@ class FuzzTask:
     status: TaskStatus = TaskStatus.PENDING
     config: dict = field(default_factory=dict)
     base_requests: list = field(default_factory=list)
+    all_mutations: list = field(default_factory=list)
+    sent_count: int = 0
     results: list = field(default_factory=list)
     anomalies: list = field(default_factory=list)
     progress: dict = field(default_factory=dict)
@@ -69,6 +72,7 @@ class FuzzTask:
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     _thread: threading.Thread | None = field(default=None, repr=False)
+    _pause_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
 
 _tasks: dict[str, FuzzTask] = {}

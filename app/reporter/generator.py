@@ -66,6 +66,41 @@ def generate_report(
     return report
 
 
+def filter_anomalies(
+    anomalies: list[Anomaly],
+    field_path: str | None = None,
+    mutation_type: str | None = None,
+    status_code_min: int | None = None,
+    status_code_max: int | None = None,
+    severity: list[str] | None = None,
+    category: list[str] | None = None,
+) -> list[Anomaly]:
+    filtered = []
+    for a in anomalies:
+        if severity and a.severity not in severity:
+            continue
+        if category and a.category not in category:
+            continue
+        if field_path:
+            fp = a.request_data.get("field_path", "")
+            if field_path.lower() not in fp.lower():
+                continue
+        if mutation_type:
+            mt = a.request_data.get("mutation_type", "")
+            if mutation_type.lower() not in mt.lower():
+                continue
+        if status_code_min is not None:
+            sc = a.response_data.get("status_code") or 0
+            if sc < status_code_min:
+                continue
+        if status_code_max is not None:
+            sc = a.response_data.get("status_code") or 0
+            if sc > status_code_max:
+                continue
+        filtered.append(a)
+    return filtered
+
+
 def _generate_recommendations(anomalies: list, severity_counts: dict) -> list[str]:
     recommendations = []
 
@@ -166,3 +201,75 @@ def format_har_compatible(test_cases: list[dict]) -> dict:
             "entries": entries,
         }
     }
+
+
+def format_curl_commands(test_cases: list[dict]) -> str:
+    lines = []
+    for tc in test_cases:
+        req = tc["request"]
+        method = req.get("method", "GET")
+        url = req.get("url", "")
+        body = req.get("body", "")
+        headers = req.get("headers", {})
+
+        cmd_parts = ["curl", "-X", method]
+        for h_name, h_value in headers.items():
+            cmd_parts.append("-H")
+            cmd_parts.append(f'"{h_name}: {h_value}"')
+        if body:
+            escaped_body = body.replace("\\", "\\\\").replace('"', '\\"')
+            cmd_parts.append("-d")
+            cmd_parts.append(f'"{escaped_body}"')
+        cmd_parts.append(f'"{url}"')
+
+        line = " \\\n  ".join(cmd_parts)
+        lines.append(
+            f"# TC-{tc['id']} [{tc['severity']}] {tc['category']}: {tc['trigger_reason']}\n{line}"
+        )
+
+    return "\n\n".join(lines)
+
+
+def format_pytest_script(test_cases: list[dict]) -> str:
+    script = '''"""
+回归测试 — 由 FuzzHarvester 自动生成
+"""
+import requests
+import pytest
+
+
+BASE_TIMEOUT = 30
+
+'''
+    for i, tc in enumerate(test_cases):
+        req = tc["request"]
+        method = req.get("method", "GET")
+        url = req.get("url", "")
+        body = req.get("body", "")
+        headers = req.get("headers", {})
+        severity = tc["severity"]
+        category = tc["category"]
+        reason = tc["trigger_reason"]
+
+        safe_name = f"tc_{i+1:03d}_{severity}_{category}"
+        safe_name = ''.join(c if c.isalnum() else '_' for c in safe_name)
+
+        script += f'''
+@pytest.mark.{severity}
+@pytest.mark.{category}
+def test_{safe_name}():
+    """[{severity}] {category}: {reason}"""
+    resp = requests.{method.lower()}(
+        "{url}",
+        headers={json.dumps(headers)},
+'''
+        if body:
+            script += f'        data={json.dumps(body)},\n'
+        script += f'''        timeout=BASE_TIMEOUT,
+    )
+    assert resp.status_code < 500, (
+        f"Server error {{resp.status_code}}: {{resp.text[:200]}}"
+    )
+'''
+
+    return script

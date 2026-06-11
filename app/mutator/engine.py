@@ -77,6 +77,34 @@ TYPE_CONFUSION_MUTATIONS = [
     ("number_for_bool", 42, "数字替代布尔值"),
 ]
 
+SAFE_HEADERS = {
+    "host", "content-length", "transfer-encoding", "connection",
+    "proxy-connection", "keep-alive", "upgrade", "te",
+    "trailer", "proxy-authorization", "proxy-authenticate",
+}
+
+HEADER_MUTATIONS = [
+    ("empty_string", "", "空字符串"),
+    ("null_value", None, "Null值"),
+    ("max_length_1k", "A" * 1024, "超长字符串1KB"),
+    ("sql_injection_1", "' OR '1'='1", "SQL注入(OR)"),
+    ("sql_injection_2", "' OR '1'='1' -- ", "SQL注入(OR注释)"),
+    ("xss_1", "<script>alert(1)</script>", "XSS注入"),
+    ("path_traversal_1", "../../../etc/passwd", "路径遍历"),
+    ("command_injection_1", "; ls -la", "命令注入(;)"),
+    ("template_injection_1", "{{7*7}}", "模板注入(SSTI)"),
+    ("unicode_bom", "\ufeff", "BOM字符"),
+    ("unicode_null", "\u0000", "Null字节"),
+    ("unicode_emoji", "😀💉🔥", "Emoji注入"),
+    ("special_chars", "!@#$%^&*()_+-=[]{}|;':\",./<>?", "特殊字符"),
+    ("newline_injection", "foo\r\nbar", "换行注入"),
+    ("auth_bearer_invalid", "Bearer invalid_token_xyz", "无效Bearer令牌"),
+    ("auth_basic_invalid", "Basic YWRtaW46d3Jvbmc=", "无效Basic认证"),
+    ("content_type_html", "text/html", "Content-Type变更为HTML"),
+    ("content_type_xml", "application/xml", "Content-Type变更为XML"),
+    ("content_type_form", "application/x-www-form-urlencoded", "Content-Type变更为表单"),
+]
+
 
 def get_all_mutations() -> list[tuple[str, object, str]]:
     return (
@@ -274,6 +302,12 @@ def apply_url_mutation(url: str, field: str, new_value, location: str = "query")
     return url
 
 
+def apply_header_mutation(base_headers: dict, header_name: str, new_value) -> dict:
+    new_headers = copy.deepcopy(base_headers)
+    new_headers[header_name] = str(new_value)
+    return new_headers
+
+
 def generate_mutations(
     base_request: dict,
     max_depth: str = "top_level",
@@ -318,6 +352,13 @@ def generate_mutations(
                 segment_name = path_parts[idx]
                 all_fields.append(("path", str(idx), pv.get("value", ""), segment_name))
 
+    if "headers" in target_locations:
+        base_headers = base_request.get("headers", {})
+        for h_name, h_value in base_headers.items():
+            if h_name.lower() in SAFE_HEADERS:
+                continue
+            all_fields.append(("header", h_name, h_value))
+
     for field_entry in all_fields:
         if len(field_entry) == 3:
             location, field_name, original_value = field_entry
@@ -329,7 +370,10 @@ def generate_mutations(
         if isinstance(display_value, (dict, list)):
             display_value = json.dumps(display_value)
 
-        mutations_for_field = _get_mutations_for_type(original_value)
+        if location == "header":
+            mutations_for_field = HEADER_MUTATIONS
+        else:
+            mutations_for_field = _get_mutations_for_type(original_value)
 
         field_mutation_count = 0
         for mut_name, mut_value, mut_desc in mutations_for_field:
@@ -351,9 +395,15 @@ def generate_mutations(
                 mutated_req["query_params"][field_name] = str(mut_value)
             elif location == "path":
                 mutated_req["url"] = apply_url_mutation(url, field_name, mut_value, "path")
+            elif location == "header":
+                mutated_req["headers"] = apply_header_mutation(
+                    base_request.get("headers", {}), field_name, mut_value,
+                )
 
             if location == "path" and segment_name:
                 path_label = f"{location}:/.../{segment_name}>seg[{field_name}]"
+            elif location == "header":
+                path_label = f"{location}>{field_name}"
             else:
                 path_label = f"{location}>{field_name}"
 
@@ -376,6 +426,8 @@ def _classify_strategy(mutation_name: str) -> str:
                                  "command_injection", "template_injection",
                                  "format_string", "special_chars",
                                  "newline_injection")):
+        return "special"
+    if mutation_name.startswith(("auth_", "content_type_")):
         return "special"
     if mutation_name.startswith("unicode_"):
         return "unicode"
