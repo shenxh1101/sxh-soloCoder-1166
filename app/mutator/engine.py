@@ -19,7 +19,7 @@ STRING_MUTATIONS = [
     ("sql_injection_5", "1' AND SLEEP(5)--", "SQL注入(SLEEP)"),
     ("xss_1", "<script>alert(1)</script>", "XSS注入"),
     ("xss_2", "<img src=x onerror=alert(1)>", "XSS(onerror)"),
-    ("xss_3", "\"><script>alert(1)</script>", "XSS(属性逃逸)"),
+    ("xss_3", '"><script>alert(1)</script>', "XSS(属性逃逸)"),
     ("xss_4", "javascript:alert(1)", "XSS(javascript协议)"),
     ("path_traversal_1", "../../../etc/passwd", "路径遍历"),
     ("path_traversal_2", "..\\..\\..\\windows\\system32", "路径遍历(Windows)"),
@@ -40,7 +40,6 @@ STRING_MUTATIONS = [
     ("json_nesting", json.dumps({"a": {"b": {"c": {"d": {"e": 1}}}}}), "深层JSON嵌套"),
 ]
 
-
 INTEGER_MUTATIONS = [
     ("zero", 0, "零值"),
     ("negative", -1, "负值"),
@@ -48,10 +47,9 @@ INTEGER_MUTATIONS = [
     ("min_int", MIN_INT, "最小整数"),
     ("overflow_32", MAX_INT + 1, "32位溢出"),
     ("underflow_32", MIN_INT - 1, "32位下溢"),
-    ("overflow_64", 2**64, "64位溢出"),
+    ("overflow_64", 2 ** 64, "64位溢出"),
     ("very_negative", -999999999, "超大负值"),
 ]
-
 
 BOOLEAN_MUTATIONS = [
     ("bool_false", False, "False"),
@@ -62,7 +60,6 @@ BOOLEAN_MUTATIONS = [
     ("bool_int_0", 0, "整数0"),
 ]
 
-
 FLOAT_MUTATIONS = [
     ("float_zero", 0.0, "0.0"),
     ("float_negative", -1.5, "负浮点数"),
@@ -72,7 +69,6 @@ FLOAT_MUTATIONS = [
     ("float_min", 1e-308, "最小正浮点数"),
     ("float_scientific", "1e9999", "科学计数法"),
 ]
-
 
 TYPE_CONFUSION_MUTATIONS = [
     ("array_value", ["x"], "数组替代标量"),
@@ -122,16 +118,9 @@ def _get_mutations_for_type(value) -> list[tuple[str, object, str]]:
     if vtype in ("integer",):
         return STRING_MUTATIONS + INTEGER_MUTATIONS + TYPE_CONFUSION_MUTATIONS
     if vtype in ("float",):
-        return (
-            STRING_MUTATIONS + INTEGER_MUTATIONS + FLOAT_MUTATIONS + TYPE_CONFUSION_MUTATIONS
-        )
+        return STRING_MUTATIONS + INTEGER_MUTATIONS + FLOAT_MUTATIONS + TYPE_CONFUSION_MUTATIONS
     if vtype == "boolean":
-        return (
-            STRING_MUTATIONS
-            + BOOLEAN_MUTATIONS
-            + INTEGER_MUTATIONS
-            + TYPE_CONFUSION_MUTATIONS
-        )
+        return STRING_MUTATIONS + BOOLEAN_MUTATIONS + INTEGER_MUTATIONS + TYPE_CONFUSION_MUTATIONS
     if vtype == "array":
         return STRING_MUTATIONS + TYPE_CONFUSION_MUTATIONS
     if vtype == "object":
@@ -139,12 +128,12 @@ def _get_mutations_for_type(value) -> list[tuple[str, object, str]]:
     return get_all_mutations()
 
 
-def extract_fields(body_str: str | None) -> dict:
+def extract_fields(body_str: str | None, max_depth: str = "nested") -> dict:
     if not body_str:
         return {}
     try:
         data = json.loads(body_str)
-        return _flatten_fields(data)
+        return _flatten_fields(data, "", max_depth)
     except (json.JSONDecodeError, TypeError):
         form_fields = {}
         for pair in body_str.split("&"):
@@ -154,25 +143,32 @@ def extract_fields(body_str: str | None) -> dict:
         return form_fields
 
 
-def _flatten_fields(data, prefix="") -> dict:
+def _flatten_fields(data, prefix="", max_depth="nested") -> dict:
     result = {}
+
     if isinstance(data, dict):
         for k, v in data.items():
             path = f"{prefix}.{k}" if prefix else k
             if isinstance(v, (dict, list)):
-                result.update(_flatten_fields(v, path))
                 result[path] = v
+                if max_depth == "nested":
+                    result.update(_flatten_fields(v, path, max_depth))
             else:
                 result[path] = v
     elif isinstance(data, list):
         for i, item in enumerate(data):
             path = f"{prefix}[{i}]"
             if isinstance(item, (dict, list)):
-                result.update(_flatten_fields(item, path))
                 result[path] = item
+                if max_depth == "nested":
+                    result.update(_flatten_fields(item, path, max_depth))
             else:
                 result[path] = item
     return result
+
+
+def _is_scalar(value) -> bool:
+    return not isinstance(value, (dict, list))
 
 
 def unflatten_value(fields: dict, path: str, new_value) -> dict:
@@ -244,15 +240,17 @@ def apply_url_mutation(url: str, field: str, new_value, location: str = "query")
     parsed = urlparse(url)
 
     if location == "path":
-        path_parts = parsed.path.split("/")
+        raw_parts = parsed.path.split("/")
         try:
-            idx = int(field)
-            if idx < len(path_parts):
-                path_parts[idx] = str(new_value)
-                new_path = "/".join(path_parts) if path_parts[0] else "/" + "/".join(path_parts[1:])
-                return urlunparse(
-                    (parsed.scheme, parsed.netloc, new_path, parsed.params, parsed.query, parsed.fragment)
-                )
+            segment_idx = int(field)
+            raw_idx = segment_idx + 1
+            if raw_idx < len(raw_parts):
+                raw_parts[raw_idx] = str(new_value)
+                new_path = "/".join(raw_parts)
+                return urlunparse((
+                    parsed.scheme, parsed.netloc, new_path,
+                    parsed.params, parsed.query, parsed.fragment,
+                ))
         except (ValueError, IndexError):
             pass
         return url
@@ -268,9 +266,10 @@ def apply_url_mutation(url: str, field: str, new_value, location: str = "query")
                     params[pair] = ""
         params[field] = str(new_value)
         new_query = urlencode(params)
-        return urlunparse(
-            (parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment)
-        )
+        return urlunparse((
+            parsed.scheme, parsed.netloc, parsed.path,
+            parsed.params, new_query, parsed.fragment,
+        ))
 
     return url
 
@@ -279,53 +278,72 @@ def generate_mutations(
     base_request: dict,
     max_depth: str = "top_level",
     enabled_strategies: list[str] | None = None,
+    target_locations: list[str] | None = None,
+    max_mutations_per_field: int | None = None,
 ) -> list[dict]:
+    if enabled_strategies is None:
+        enabled_strategies = ["string", "integer", "special", "unicode", "type_confusion"]
+    if target_locations is None:
+        target_locations = ["query", "path", "body"]
+
     mutations = []
-    body_fields = extract_fields(base_request.get("body"))
+    body_fields = extract_fields(base_request.get("body"), max_depth=max_depth)
     query_params = base_request.get("query_params", {})
     path_variables = base_request.get("path_variables", [])
     url = base_request.get("url", "")
 
-    if enabled_strategies is None:
-        enabled_strategies = ["string", "integer", "special", "unicode", "type_confusion"]
-
     all_fields = []
 
-    for field_name, value in body_fields.items():
-        if max_depth == "top_level" and "." not in field_name and "[" not in field_name:
+    if "body" in target_locations:
+        for field_name, value in body_fields.items():
+            if max_depth == "top_level":
+                if "." in field_name or "[" in field_name:
+                    continue
+                if not _is_scalar(value):
+                    continue
+            elif max_depth == "nested":
+                if not _is_scalar(value):
+                    continue
             all_fields.append(("body", field_name, value))
-        elif max_depth == "nested":
-            all_fields.append(("body", field_name, value))
-        elif max_depth == "top_level":
-            parts = re.split(r"\.|(?=\[\d+\])", field_name)
-            parts = [p for p in parts if p]
-            is_top = len(parts) <= 2
-            if is_top:
-                all_fields.append(("body", field_name, value))
 
-    for field_name, value in query_params.items():
-        all_fields.append(("query", field_name, value))
+    if "query" in target_locations:
+        for field_name, value in query_params.items():
+            all_fields.append(("query", field_name, value))
 
-    for pv in path_variables:
-        idx = pv.get("index")
-        if idx is not None:
-            all_fields.append(("path", str(idx), pv.get("value", "")))
+    if "path" in target_locations:
+        path_parts = [p for p in urlparse(url).path.split("/") if p]
+        for pv in path_variables:
+            idx = pv.get("index")
+            if idx is not None and idx < len(path_parts):
+                segment_name = path_parts[idx]
+                all_fields.append(("path", str(idx), pv.get("value", ""), segment_name))
 
-    for location, field_name, original_value in all_fields:
+    for field_entry in all_fields:
+        if len(field_entry) == 3:
+            location, field_name, original_value = field_entry
+            segment_name = None
+        else:
+            location, field_name, original_value, segment_name = field_entry
+
         display_value = original_value
         if isinstance(display_value, (dict, list)):
             display_value = json.dumps(display_value)
+
         mutations_for_field = _get_mutations_for_type(original_value)
 
+        field_mutation_count = 0
         for mut_name, mut_value, mut_desc in mutations_for_field:
             strategy = _classify_strategy(mut_name)
             if strategy not in enabled_strategies:
                 continue
+            if max_mutations_per_field is not None and field_mutation_count >= max_mutations_per_field:
+                break
 
             mutated_req = copy.deepcopy(base_request)
+
             if location == "body":
                 mutated_req["body"] = apply_body_mutation(
-                    mutated_req.get("body"), field_name, mut_value
+                    mutated_req.get("body"), field_name, mut_value,
                 )
             elif location == "query":
                 mutated_req["url"] = apply_url_mutation(url, field_name, mut_value, "query")
@@ -334,34 +352,41 @@ def generate_mutations(
             elif location == "path":
                 mutated_req["url"] = apply_url_mutation(url, field_name, mut_value, "path")
 
-            mutations.append(
-                {
-                    "original_request": base_request,
-                    "mutated_request": mutated_req,
-                    "mutation_type": mut_name,
-                    "mutation_desc": mut_desc,
-                    "field_path": f"{location}>{field_name}",
-                    "original_value": str(display_value),
-                    "mutated_value": str(mut_value),
-                }
-            )
+            if location == "path" and segment_name:
+                path_label = f"{location}:/.../{segment_name}>seg[{field_name}]"
+            else:
+                path_label = f"{location}>{field_name}"
+
+            mutations.append({
+                "original_request": base_request,
+                "mutated_request": mutated_req,
+                "mutation_type": mut_name,
+                "mutation_desc": mut_desc,
+                "field_path": path_label,
+                "original_value": str(display_value),
+                "mutated_value": str(mut_value),
+            })
+            field_mutation_count += 1
 
     return mutations
 
 
 def _classify_strategy(mutation_name: str) -> str:
-    if mutation_name.startswith(("sql_injection", "xss_", "path_traversal", "command_injection",
-                                 "template_injection", "format_string", "special_chars",
+    if mutation_name.startswith(("sql_injection", "xss_", "path_traversal",
+                                 "command_injection", "template_injection",
+                                 "format_string", "special_chars",
                                  "newline_injection")):
         return "special"
     if mutation_name.startswith("unicode_"):
         return "unicode"
-    if any(mutation_name.startswith(p) for p in ("array_value", "object_value",
-                                                   "string_for_number", "number_for_bool")):
+    if any(mutation_name.startswith(p) for p in (
+        "array_value", "object_value", "string_for_number", "number_for_bool",
+    )):
         return "type_confusion"
     if any(mutation_name.startswith(p) for p in ("bool_", "float_")):
         return "integer"
-    if mutation_name in ("zero", "negative", "max_int", "min_int", "overflow_32",
-                          "underflow_32", "overflow_64", "very_negative"):
+    if mutation_name in ("zero", "negative", "max_int", "min_int",
+                          "overflow_32", "underflow_32", "overflow_64",
+                          "very_negative"):
         return "integer"
     return "string"

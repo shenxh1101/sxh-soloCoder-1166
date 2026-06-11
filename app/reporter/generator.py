@@ -37,7 +37,9 @@ def generate_report(
 
     top_anomalies = sorted(
         [asdict(a) for a in anomalies],
-        key=lambda x: {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1}.get(x["severity"], 0),
+        key=lambda x: {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1}.get(
+            x["severity"], 0
+        ),
         reverse=True,
     )[:50]
 
@@ -73,9 +75,9 @@ def _generate_recommendations(anomalies: list, severity_counts: dict) -> list[st
         )
 
     if any(a.category == "blacklist_match" for a in anomalies):
-        blacklist_anomalies = [a for a in anomalies if a.category == "blacklist_match"]
+        blacklist_count = len([a for a in anomalies if a.category == "blacklist_match"])
         recommendations.append(
-            f"发现 {len(blacklist_anomalies)} 个响应暴露了敏感错误信息。"
+            f"发现 {blacklist_count} 个响应暴露了敏感错误信息。"
             "建议对生产环境关闭详细错误信息输出。"
         )
 
@@ -99,26 +101,38 @@ def _generate_recommendations(anomalies: list, severity_counts: dict) -> list[st
             "可能存在SQL注入、正则ReDoS或资源密集型操作。"
         )
 
-    for a in anomalies:
-        if hasattr(a, 'mutation_type') and a.mutation_type and a.mutation_type.startswith("sql_injection"):
-            if not any("SQL注入防护" in r for r in recommendations):
-                recommendations.append(
-                    "检测到SQL注入相关变异引发了异常响应，强烈建议使用参数化查询。"
-                )
-            break
+    if any(a.category == "connection_error" for a in anomalies):
+        conn_count = len([a for a in anomalies if a.category == "connection_error"])
+        recommendations.append(
+            f"发现 {conn_count} 个连接错误，输入可能导致服务端崩溃或拒绝连接。"
+        )
 
     return recommendations
 
 
-def export_anomaly_requests(anomalies: list[Anomaly]) -> list[dict]:
+def export_anomaly_requests(
+    anomalies: list[Anomaly],
+    severity_filter: list[str] | None = None,
+    category_filter: list[str] | None = None,
+) -> list[dict]:
     test_cases = []
     for i, a in enumerate(anomalies):
-        test_cases.append({
+        if severity_filter and a.severity not in severity_filter:
+            continue
+        if category_filter and a.category not in category_filter:
+            continue
+
+        tc = {
             "id": i + 1,
             "severity": a.severity,
             "category": a.category,
+            "trigger_reason": a.description,
+            "response_time_ms": a.response_time_ms,
+            "response_evidence": a.response_data,
             "request": a.request_data,
-        })
+        }
+        test_cases.append(tc)
+
     return test_cases
 
 
@@ -131,8 +145,7 @@ def format_har_compatible(test_cases: list[dict]) -> dict:
                 "method": req.get("method", "GET"),
                 "url": req.get("url", ""),
                 "headers": [
-                    {"name": k, "value": v}
-                    for k, v in req.get("headers", {}).items()
+                    {"name": k, "value": v} for k, v in req.get("headers", {}).items()
                 ],
                 "postData": {"text": req.get("body", "")} if req.get("body") else {},
             },
@@ -141,6 +154,7 @@ def format_har_compatible(test_cases: list[dict]) -> dict:
                 "test_case_id": tc["id"],
                 "severity": tc["severity"],
                 "category": tc["category"],
+                "trigger_reason": tc["trigger_reason"],
             },
         }
         entries.append(entry)

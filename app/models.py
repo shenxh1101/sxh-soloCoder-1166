@@ -1,7 +1,8 @@
 import uuid
 import time
+import threading
 from enum import Enum
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 
 
 class TaskStatus(str, Enum):
@@ -67,6 +68,7 @@ class FuzzTask:
     report: dict = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
+    _thread: threading.Thread | None = field(default=None, repr=False)
 
 
 _tasks: dict[str, FuzzTask] = {}

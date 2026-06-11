@@ -1,6 +1,7 @@
 import json
 import time
-import copy
+import threading
+from dataclasses import asdict
 from flask import Blueprint, request, jsonify
 
 from app.models import (
@@ -13,8 +14,6 @@ from app.parser.parsers import parse_har, parse_curl
 from app.mutator.engine import generate_mutations
 from app.sender.concurrent import send_batch
 from app.analyzer.detector import analyze_response
-from dataclasses import asdict
-
 from app.reporter.generator import (
     generate_report,
     export_anomaly_requests,
@@ -70,6 +69,116 @@ def upload_samples():
     return jsonify({"error": "请上传文件或提供JSON body"}), 400
 
 
+def _run_fuzz_background(task):
+    task.status = TaskStatus.RUNNING
+    task.progress = {
+        "total_mutations": 0,
+        "sent": 0,
+        "anomalies_found": 0,
+        "phase": "generating",
+        "estimated_seconds_remaining": None,
+        "started_at": time.time(),
+    }
+    task.updated_at = time.time()
+
+    try:
+        results = []
+        anomalies = []
+        all_mutations = []
+        config = task.config
+        base_requests = task.base_requests
+
+        for br in base_requests:
+            if task.status == TaskStatus.CANCELLED:
+                return
+            muts = generate_mutations(
+                br,
+                max_depth=config.get("max_depth", "top_level"),
+                enabled_strategies=config.get("enabled_strategies"),
+                target_locations=config.get("target_locations"),
+                max_mutations_per_field=config.get("max_mutations_per_field"),
+            )
+            all_mutations.extend(muts)
+
+        total = len(all_mutations)
+        task.progress["total_mutations"] = total
+
+        task.progress["phase"] = "sending"
+        task.updated_at = time.time()
+
+        concurrency = config.get("concurrency", 10)
+        batch_size = concurrency * 2
+        send_start = time.time()
+
+        for i in range(0, total, batch_size):
+            if task.status == TaskStatus.CANCELLED:
+                task.progress["phase"] = "cancelled"
+                task.updated_at = time.time()
+                return
+
+            batch_end = min(i + batch_size, total)
+            batch = all_mutations[i:batch_end]
+            batch_results = send_batch(
+                batch,
+                concurrency=concurrency,
+                timeout=config.get("timeout", 30),
+            )
+            results.extend(batch_results)
+
+            task.progress["phase"] = "analyzing"
+            for br_result in batch_results:
+                br_result_anomalies = analyze_response(
+                    br_result,
+                    blacklist=config.get("blacklist"),
+                    slow_threshold_ms=config.get("slow_threshold_ms", 5000),
+                )
+                for anom in br_result_anomalies:
+                    anom.request_data["mutation_type"] = br_result.get("mutation_type", "")
+                    anom.request_data["field_path"] = br_result.get("field_path", "")
+                    anom.request_data["mutation_desc"] = br_result.get("mutation_desc", "")
+                    anom.request_data["mutated_value"] = br_result.get("mutated_value", "")
+                anomalies.extend(br_result_anomalies)
+
+            task.progress["sent"] = batch_end
+            task.progress["anomalies_found"] = len(anomalies)
+            task.progress["phase"] = "sending"
+
+            elapsed = time.time() - send_start
+            if batch_end > 0 and elapsed > 0:
+                rate = batch_end / elapsed
+                remaining = total - batch_end
+                if rate > 0:
+                    task.progress["estimated_seconds_remaining"] = round(remaining / rate)
+
+            task.updated_at = time.time()
+
+        task.results = results
+        task.anomalies = anomalies
+
+        task.progress["phase"] = "reporting"
+        task.updated_at = time.time()
+
+        report = generate_report(
+            task_id=task.task_id,
+            base_requests=base_requests,
+            results=results,
+            anomalies=anomalies,
+            config=config,
+            start_time=task.created_at,
+            end_time=time.time(),
+        )
+        task.report = report
+        task.status = TaskStatus.COMPLETED
+    except Exception as e:
+        task.status = TaskStatus.FAILED
+        task.progress["phase"] = "failed"
+        task.progress["error"] = str(e)
+    finally:
+        task.progress["phase"] = task.status.value
+        task.progress["estimated_seconds_remaining"] = 0
+        task.updated_at = time.time()
+
+
 @api.route("/api/fuzz/start", methods=["POST"])
 def start_fuzz():
     data = request.get_json(silent=True)
@@ -87,91 +196,21 @@ def start_fuzz():
         "slow_threshold_ms": data.get("slow_threshold_ms", 5000),
         "blacklist": data.get("blacklist", None),
         "enabled_strategies": data.get("enabled_strategies", None),
+        "target_locations": data.get("target_locations", None),
+        "max_mutations_per_field": data.get("max_mutations_per_field", None),
     }
 
     task = create_task(config, samples)
 
-    return jsonify({"task_id": task.task_id, "status": task.status.value})
+    thread = threading.Thread(target=_run_fuzz_background, args=(task,), daemon=True)
+    task._thread = thread
+    thread.start()
 
-
-@api.route("/api/fuzz/run/<task_id>", methods=["POST"])
-def run_fuzz(task_id):
-    task = get_task(task_id)
-    if not task:
-        return jsonify({"error": "任务不存在"}), 404
-    if task.status == TaskStatus.RUNNING:
-        return jsonify({"error": "任务已在运行中"}), 409
-
-    task.status = TaskStatus.RUNNING
-    task.updated_at = time.time()
-
-    results = []
-    anomalies = []
-    all_mutations = []
-    base_requests = task.base_requests
-
-    for br in base_requests:
-        muts = generate_mutations(
-            br,
-            max_depth=task.config.get("max_depth", "top_level"),
-            enabled_strategies=task.config.get("enabled_strategies"),
-        )
-        all_mutations.extend(muts)
-
-    task.progress = {
-        "total_mutations": len(all_mutations),
-        "sent": 0,
-        "anomalies_found": 0,
-    }
-
-    batch_size = task.config.get("concurrency", 10)
-
-    for i in range(0, len(all_mutations), batch_size):
-        if task.status == TaskStatus.CANCELLED:
-            break
-
-        batch = all_mutations[i : i + batch_size]
-        batch_results = send_batch(
-            batch,
-            concurrency=task.config.get("concurrency", 10),
-            timeout=task.config.get("timeout", 30),
-        )
-        results.extend(batch_results)
-
-        for br_result in batch_results:
-            br_result_anomalies = analyze_response(
-                br_result,
-                blacklist=task.config.get("blacklist"),
-                slow_threshold_ms=task.config.get("slow_threshold_ms", 5000),
-            )
-            anomalies.extend(br_result_anomalies)
-
-        task.progress["sent"] = i + len(batch)
-        task.progress["anomalies_found"] = len(anomalies)
-        task.updated_at = time.time()
-
-    task.results = results
-    task.anomalies = anomalies
-
-    report = generate_report(
-        task_id=task.task_id,
-        base_requests=base_requests,
-        results=results,
-        anomalies=anomalies,
-        config=task.config,
-        start_time=task.created_at,
-        end_time=time.time(),
-    )
-    task.report = report
-    task.status = TaskStatus.COMPLETED
-    task.progress = {
-        "total_mutations": len(all_mutations),
-        "sent": len(results),
-        "anomalies_found": len(anomalies),
-    }
-    task.updated_at = time.time()
-
-    return jsonify({"task_id": task_id, "status": "completed"})
+    return jsonify({
+        "task_id": task.task_id,
+        "status": TaskStatus.RUNNING.value,
+        "message": "任务已启动，后台异步执行中",
+    })
 
 
 @api.route("/api/fuzz/tasks/<task_id>/status", methods=["GET"])
@@ -225,12 +264,32 @@ def save_anomalies(task_id):
     if not task:
         return jsonify({"error": "任务不存在"}), 404
 
-    test_cases = export_anomaly_requests(task.anomalies)
+    body = request.get_json(silent=True) or {}
+    severity_filter = body.get("severity")
+    category_filter = body.get("category")
+
+    if severity_filter and isinstance(severity_filter, str):
+        severity_filter = [s.strip() for s in severity_filter.split(",")]
+    if category_filter and isinstance(category_filter, str):
+        category_filter = [c.strip() for c in category_filter.split(",")]
+
+    test_cases = export_anomaly_requests(
+        task.anomalies,
+        severity_filter=severity_filter,
+        category_filter=category_filter,
+    )
     har_data = format_har_compatible(test_cases)
+
+    applied_filters = {
+        "severity": severity_filter,
+        "category": category_filter,
+    }
 
     return jsonify({
         "task_id": task.task_id,
-        "test_case_count": len(test_cases),
+        "total_anomalies": len(task.anomalies),
+        "filtered_count": len(test_cases),
+        "applied_filters": applied_filters,
         "test_cases": test_cases,
         "har_export": har_data,
     })
@@ -248,5 +307,6 @@ def cancel_task(task_id):
         return jsonify({"error": "任务不存在"}), 404
 
     task.status = TaskStatus.CANCELLED
+    task.progress["phase"] = "cancelled"
     task.updated_at = time.time()
     return jsonify({"task_id": task_id, "status": "cancelled"})
