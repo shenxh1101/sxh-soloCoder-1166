@@ -69,13 +69,27 @@ class FuzzTask:
     anomalies: list = field(default_factory=list)
     progress: dict = field(default_factory=dict)
     report: dict = field(default_factory=dict)
+    baseline: dict | None = None
+    dedup_skipped: int = 0
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     _thread: threading.Thread | None = field(default=None, repr=False)
     _pause_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    _stopped: bool = field(default=False, repr=False)
 
 
 _tasks: dict[str, FuzzTask] = {}
+
+
+def _init_storage():
+    from app.storage import restore_tasks_into
+
+    count = restore_tasks_into(_tasks)
+    if count > 0:
+        print(f"[storage] 从磁盘恢复了 {count} 个历史任务")
+
+
+_init_storage()
 
 
 def create_task(config: dict, base_requests: list) -> FuzzTask:

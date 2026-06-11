@@ -5,6 +5,133 @@ from app.models import Anomaly
 from app.analyzer.detector import aggregate_by_severity
 
 
+def deduplicate_anomalies(anomalies: list[Anomaly]) -> tuple[list[Anomaly], int]:
+    seen = set()
+    deduped = []
+    skipped = 0
+    for a in anomalies:
+        fp = a.request_data.get("field_path", "")
+        cat = a.category
+        key = (fp, cat)
+        if key in seen:
+            skipped += 1
+            continue
+        seen.add(key)
+        deduped.append(a)
+    return deduped, skipped
+
+
+def compute_request_diff(
+    original_request: dict | None, mutated_request: dict | None
+) -> dict:
+    if not original_request or not mutated_request:
+        return {}
+
+    changes = []
+
+    orig_url = original_request.get("url", "")
+    mut_url = mutated_request.get("url", "")
+    if orig_url != mut_url:
+        changes.append({
+            "location": "url",
+            "original": orig_url,
+            "mutated": mut_url,
+        })
+
+    orig_qp = original_request.get("query_params", {})
+    mut_qp = mutated_request.get("query_params", {})
+    for k in set(list(orig_qp.keys()) + list(mut_qp.keys())):
+        ov = orig_qp.get(k)
+        mv = mut_qp.get(k)
+        if str(ov) != str(mv):
+            changes.append({
+                "location": f"query>{k}",
+                "original": str(ov),
+                "mutated": str(mv),
+            })
+
+    orig_body = original_request.get("body", "")
+    mut_body = mutated_request.get("body", "")
+    if orig_body != mut_body:
+        orig_parsed = _try_parse_json(orig_body)
+        mut_parsed = _try_parse_json(mut_body)
+        if orig_parsed and mut_parsed:
+            _diff_json_fields(orig_parsed, mut_parsed, "body", changes)
+        else:
+            changes.append({
+                "location": "body",
+                "original": (orig_body or "")[:500],
+                "mutated": (mut_body or "")[:500],
+            })
+
+    orig_headers = original_request.get("headers", {})
+    mut_headers = mutated_request.get("headers", {})
+    for k in set(list(orig_headers.keys()) + list(mut_headers.keys())):
+        ov = orig_headers.get(k)
+        mv = mut_headers.get(k)
+        if str(ov) != str(mv):
+            changes.append({
+                "location": f"header>{k}",
+                "original": str(ov),
+                "mutated": str(mv),
+            })
+
+    orig_method = original_request.get("method", "")
+    mut_method = mutated_request.get("method", "")
+    if orig_method and mut_method and orig_method != mut_method:
+        changes.append({
+            "location": "method",
+            "original": orig_method,
+            "mutated": mut_method,
+        })
+
+    return {"field_changes": changes, "change_count": len(changes)}
+
+
+def _try_parse_json(s: str | None) -> dict | None:
+    if not s:
+        return None
+    try:
+        return json.loads(s)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _diff_json_fields(
+    orig: dict | list,
+    mutated: dict | list,
+    prefix: str,
+    changes: list,
+):
+    if isinstance(orig, dict) and isinstance(mutated, dict):
+        for k in set(list(orig.keys()) + list(mutated.keys())):
+            ov = orig.get(k)
+            mv = mutated.get(k)
+            path = f"{prefix}>{k}"
+            if isinstance(ov, (dict, list)) and isinstance(mv, (dict, list)):
+                _diff_json_fields(ov, mv, path, changes)
+            elif str(ov) != str(mv):
+                changes.append({
+                    "location": path,
+                    "original": json.dumps(ov, ensure_ascii=False),
+                    "mutated": json.dumps(mv, ensure_ascii=False),
+                })
+    elif isinstance(orig, list) and isinstance(mutated, list):
+        max_len = max(len(orig), len(mutated))
+        for i in range(max_len):
+            ov = orig[i] if i < len(orig) else None
+            mv = mutated[i] if i < len(mutated) else None
+            path = f"{prefix}[{i}]"
+            if isinstance(ov, (dict, list)) and isinstance(mv, (dict, list)):
+                _diff_json_fields(ov, mv, path, changes)
+            elif str(ov) != str(mv):
+                changes.append({
+                    "location": path,
+                    "original": json.dumps(ov, ensure_ascii=False),
+                    "mutated": json.dumps(mv, ensure_ascii=False),
+                })
+
+
 def generate_report(
     task_id: str,
     base_requests: list,
@@ -13,11 +140,16 @@ def generate_report(
     config: dict,
     start_time: float,
     end_time: float,
+    baseline: dict | None = None,
+    dedup_skipped: int = 0,
 ) -> dict:
-    severity_counts = aggregate_by_severity(anomalies)
+    deduped, skipped = deduplicate_anomalies(anomalies)
+    total_skipped = dedup_skipped + skipped
+
+    severity_counts = aggregate_by_severity(deduped)
 
     anomaly_by_category = {}
-    for a in anomalies:
+    for a in deduped:
         cat = a.category
         if cat not in anomaly_by_category:
             anomaly_by_category[cat] = []
@@ -36,12 +168,20 @@ def generate_report(
     min_response_time = min(response_times) if response_times else 0
 
     top_anomalies = sorted(
-        [asdict(a) for a in anomalies],
+        [asdict(a) for a in deduped],
         key=lambda x: {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1}.get(
             x["severity"], 0
         ),
         reverse=True,
     )[:50]
+
+    baseline_summary = None
+    if baseline:
+        baseline_summary = {
+            "status_code": baseline.get("status_code"),
+            "response_time_ms": baseline.get("response_time_ms"),
+            "error": baseline.get("error"),
+        }
 
     report = {
         "task_id": task_id,
@@ -50,7 +190,9 @@ def generate_report(
         "summary": {
             "total_requests": len(results),
             "base_samples": len(base_requests),
-            "total_anomalies": len(anomalies),
+            "total_anomalies_raw": len(anomalies),
+            "total_anomalies_deduped": len(deduped),
+            "dedup_skipped": total_skipped,
             "severity_breakdown": severity_counts,
             "status_distribution": status_distribution,
             "avg_response_time_ms": round(avg_response_time, 2),
@@ -58,9 +200,10 @@ def generate_report(
             "min_response_time_ms": round(min_response_time, 2),
         },
         "config": config,
+        "baseline": baseline_summary,
         "anomalies_by_category": anomaly_by_category,
         "top_anomalies": top_anomalies,
-        "recommendations": _generate_recommendations(anomalies, severity_counts),
+        "recommendations": _generate_recommendations(deduped, severity_counts),
     }
 
     return report
