@@ -302,12 +302,17 @@ def export_anomaly_requests(
 
         tc = {
             "id": i + 1,
-            "severity": a.severity,
+            "severity": a.severity.value if hasattr(a.severity, 'value') else a.severity,
             "category": a.category,
             "trigger_reason": a.description,
             "response_time_ms": a.response_time_ms,
             "response_evidence": a.response_data,
             "request": a.request_data,
+            "baseline": {
+                "status_code": a.response_data.get("baseline_status_code"),
+                "response_time_ms": a.response_data.get("baseline_response_time_ms"),
+                "error": a.response_data.get("baseline_error"),
+            },
         }
         test_cases.append(tc)
 
@@ -373,9 +378,10 @@ def format_curl_commands(test_cases: list[dict]) -> str:
     return "\n\n".join(lines)
 
 
-def format_pytest_script(test_cases: list[dict]) -> str:
+def format_pytest_script(test_cases: list[dict], task=None) -> str:
     script = '''"""
 回归测试 — 由 FuzzHarvester 自动生成
+每个用例携带基线信息，可直接用于 CI 回归。
 """
 import requests
 import pytest
@@ -393,15 +399,28 @@ BASE_TIMEOUT = 30
         severity = tc["severity"]
         category = tc["category"]
         reason = tc["trigger_reason"]
+        baseline = tc.get("baseline", {})
+        mutated_sc = tc.get("response_evidence", {}).get("status_code")
+        mutated_latency = tc.get("response_time_ms")
+        baseline_sc = baseline.get("status_code")
+        baseline_latency = baseline.get("response_time_ms")
 
         safe_name = f"tc_{i+1:03d}_{severity}_{category}"
         safe_name = ''.join(c if c.isalnum() else '_' for c in safe_name)
+
+        docstring_lines = []
+        if baseline_sc is not None:
+            docstring_lines.append(f"基线: status={baseline_sc}, latency={baseline_latency}ms")
+        if mutated_sc is not None:
+            docstring_lines.append(f"变异: status={mutated_sc}, latency={mutated_latency}ms")
+        docstring_lines.append(f"[{severity}] {category}: {reason}")
+        docstring = " | ".join(docstring_lines)
 
         script += f'''
 @pytest.mark.{severity}
 @pytest.mark.{category}
 def test_{safe_name}():
-    """[{severity}] {category}: {reason}"""
+    """{docstring}"""
     resp = requests.{method.lower()}(
         "{url}",
         headers={json.dumps(headers)},
@@ -412,6 +431,12 @@ def test_{safe_name}():
     )
     assert resp.status_code < 500, (
         f"Server error {{resp.status_code}}: {{resp.text[:200]}}"
+    )
+'''
+
+        if baseline_sc is not None and mutated_sc is not None and baseline_sc != mutated_sc:
+            script += f'''    assert resp.status_code == {baseline_sc}, (
+        f"回归异常! 基线状态码={{ {baseline_sc} }}, 当前状态码={{resp.status_code}} (曾触发{mutated_sc})"
     )
 '''
 

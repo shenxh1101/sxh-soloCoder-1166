@@ -46,6 +46,7 @@ def _task_to_storable(task: FuzzTask) -> dict:
         "updated_at": time.time(),
         "baseline": getattr(task, "baseline", None),
         "dedup_skipped": getattr(task, "dedup_skipped", 0),
+        "run_generation": getattr(task, "run_generation", 1),
     }
 
 
@@ -67,6 +68,7 @@ def _task_from_storable(d: dict) -> FuzzTask:
     task.status = TaskStatus(d.get("status", "pending"))
     task.baseline = d.get("baseline")
     task.dedup_skipped = d.get("dedup_skipped", 0)
+    task.run_generation = d.get("run_generation", 1)
     return task
 
 

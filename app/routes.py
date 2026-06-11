@@ -8,7 +8,7 @@ from app.models import (
     TaskStatus,
     create_task,
     get_task,
-    list_tasks,
+    list_tasks as _list_tasks,
 )
 from app.parser.parsers import parse_har, parse_curl
 from app.mutator.engine import generate_mutations
@@ -31,6 +31,17 @@ api = Blueprint("api", __name__)
 def _save_task_if_alive(task):
     if not task._stopped:
         storage.save_task(task)
+
+
+def _find_baseline_for_url(task, url: str) -> dict:
+    if not task.baseline:
+        return {}
+    if url in task.baseline:
+        return task.baseline[url]
+    for br in task.base_requests:
+        if br.get("url") == url:
+            return task.baseline.get(br["url"], {})
+    return {}
 
 
 def _collect_baseline(task):
@@ -57,6 +68,8 @@ def _run_fuzz_background(task):
     if task.status != TaskStatus.RUNNING:
         return
 
+    my_gen = task.run_generation
+
     config = task.config
     base_requests = task.base_requests
 
@@ -64,20 +77,20 @@ def _run_fuzz_background(task):
         task.progress["phase"] = "baseline"
         task.updated_at = time.time()
         _collect_baseline(task)
-        if task._stopped:
+        if task._stopped or task.run_generation != my_gen:
             return
 
     if not task.all_mutations:
         all_mutations = []
         for br in base_requests:
-            if task._stopped:
+            if task._stopped or task.run_generation != my_gen:
                 return
             while task.status == TaskStatus.PAUSED:
                 task.progress["phase"] = "paused"
                 task.updated_at = time.time()
                 _save_task_if_alive(task)
                 task._pause_event.wait()
-                if task._stopped:
+                if task._stopped or task.run_generation != my_gen:
                     return
                 task.progress["phase"] = "generating"
             muts = generate_mutations(
@@ -106,7 +119,7 @@ def _run_fuzz_background(task):
     base_resp_time = baseline_resp.get("response_time_ms") if baseline_resp else None
 
     for i in range(task.sent_count, total, batch_size):
-        if task._stopped:
+        if task._stopped or task.run_generation != my_gen:
             task.progress["phase"] = "cancelled"
             return
         if task.status == TaskStatus.PAUSED:
@@ -114,7 +127,7 @@ def _run_fuzz_background(task):
             task.updated_at = time.time()
             _save_task_if_alive(task)
             task._pause_event.wait()
-            if task._stopped:
+            if task._stopped or task.run_generation != my_gen:
                 return
             task.progress["phase"] = "sending"
             continue
@@ -126,26 +139,33 @@ def _run_fuzz_background(task):
             concurrency=concurrency,
             timeout=config.get("timeout", 30),
         )
-        if task._stopped:
+        if task._stopped or task.run_generation != my_gen:
             return
         results.extend(batch_results)
 
         task.progress["phase"] = "analyzing"
         for br_result in batch_results:
+            orig_req = br_result.get("original_request", {})
+            orig_url = (orig_req.get("url") or
+                        base_requests[0].get("url", "") if base_requests else "")
+            req_baseline = _find_baseline_for_url(task, orig_url)
+            req_base_time = req_baseline.get("response_time_ms")
+
             br_result_anomalies = analyze_response(
                 br_result,
                 blacklist=config.get("blacklist"),
                 slow_threshold_ms=config.get("slow_threshold_ms", 5000),
-                base_response_time=base_resp_time,
+                base_response_time=req_base_time,
             )
             for anom in br_result_anomalies:
                 anom.request_data["mutation_type"] = br_result.get("mutation_type", "")
                 anom.request_data["field_path"] = br_result.get("field_path", "")
                 anom.request_data["mutation_desc"] = br_result.get("mutation_desc", "")
                 anom.request_data["mutated_value"] = br_result.get("mutated_value", "")
-                anom.request_data["original_request"] = br_result.get(
-                    "original_request", {}
-                )
+                anom.request_data["original_request"] = orig_req
+                anom.response_data["baseline_status_code"] = req_baseline.get("status_code")
+                anom.response_data["baseline_response_time_ms"] = req_baseline.get("response_time_ms")
+                anom.response_data["baseline_error"] = req_baseline.get("error")
             anomalies.extend(br_result_anomalies)
 
         task.sent_count = batch_end
@@ -261,6 +281,7 @@ def start_fuzz():
 
     task = create_task(config, samples)
     task.status = TaskStatus.RUNNING
+    task.run_generation = 1
     storage.save_task(task)
 
     thread = threading.Thread(target=_run_fuzz_background, args=(task,), daemon=True)
@@ -301,15 +322,28 @@ def resume_task(task_id):
     if task.status != TaskStatus.PAUSED:
         return jsonify({"error": f"任务当前状态为 {task.status.value}，无法恢复"}), 400
 
+    old_thread = task._thread
+    thread_alive = old_thread and old_thread.is_alive()
+
     task.status = TaskStatus.RUNNING
     task.progress["phase"] = "resuming"
     task._pause_event.set()
+
+    if not thread_alive:
+        task._stopped = False
+        thread = threading.Thread(target=_run_fuzz_background, args=(task,), daemon=True)
+        task._thread = thread
+        thread.start()
+        extra_msg = "（服务重启后重新拉起后台线程）"
+    else:
+        extra_msg = ""
+
     task.updated_at = time.time()
     return jsonify({
         "task_id": task_id,
         "status": "running",
         "progress": task.progress,
-        "message": f"任务已恢复，将从第 {task.sent_count + 1} 条变异继续",
+        "message": f"任务已恢复，将从第 {task.sent_count + 1} 条变异继续{extra_msg}",
     })
 
 
@@ -326,6 +360,7 @@ def retry_task(task_id):
         old_thread.join(timeout=2)
 
     task._stopped = False
+    task.run_generation += 1
     task.sent_count = 0
     task.results = []
     task.anomalies = []
@@ -342,6 +377,7 @@ def retry_task(task_id):
         "estimated_seconds_remaining": None,
         "started_at": time.time(),
     }
+    task._pause_event = threading.Event()
     task._pause_event.set()
     thread = threading.Thread(target=_run_fuzz_background, args=(task,), daemon=True)
     task._thread = thread
@@ -352,8 +388,9 @@ def retry_task(task_id):
     return jsonify({
         "task_id": task_id,
         "status": "running",
+        "run_generation": task.run_generation,
         "progress": task.progress,
-        "message": "任务已重置，旧线程已停止，从头开始重试",
+        "message": f"任务已重置（代次 {task.run_generation}），旧线程已停止，从头开始重试",
     })
 
 
@@ -366,6 +403,7 @@ def task_status(task_id):
     return jsonify({
         "task_id": task.task_id,
         "status": task.status.value,
+        "run_generation": task.run_generation,
         "progress": task.progress,
         "created_at": task.created_at,
         "updated_at": task.updated_at,
@@ -391,29 +429,22 @@ def task_report(task_id):
 
 
 def _parse_anomaly_filters():
-    field_path = request.args.get("field_path") or (request.get_json(silent=True) or {}).get("field_path")
-    mutation_type = request.args.get("mutation_type") or (request.get_json(silent=True) or {}).get("mutation_type")
+    body = request.get_json(silent=True) or {}
+    field_path = request.args.get("field_path") or body.get("field_path")
+    mutation_type = request.args.get("mutation_type") or body.get("mutation_type")
     status_code_min = request.args.get("status_code_min", type=int)
     status_code_max = request.args.get("status_code_max", type=int)
 
     if status_code_min is None:
-        body = request.get_json(silent=True) or {}
         status_code_min = body.get("status_code_min")
     if status_code_max is None:
-        body = request.get_json(silent=True) or {}
         status_code_max = body.get("status_code_max")
 
-    severity = request.args.get("severity")
-    if not severity:
-        body = request.get_json(silent=True) or {}
-        severity = body.get("severity")
+    severity = request.args.get("severity") or body.get("severity")
     if severity and isinstance(severity, str):
         severity = [s.strip() for s in severity.split(",")]
 
-    category = request.args.get("category")
-    if not category:
-        body = request.get_json(silent=True) or {}
-        category = body.get("category")
+    category = request.args.get("category") or body.get("category")
     if category and isinstance(category, str):
         category = [c.strip() for c in category.split(",")]
 
@@ -469,7 +500,7 @@ def get_anomaly_detail(task_id, index):
     mutated_req = anom.request_data
     diff = compute_request_diff(original_req, mutated_req)
 
-    response_summary = {
+    mutated_response = {
         "status_code": anom.response_data.get("status_code"),
         "response_time_ms": anom.response_time_ms,
         "matched_keyword": anom.response_data.get("matched_keyword"),
@@ -478,13 +509,11 @@ def get_anomaly_detail(task_id, index):
         "response_body_prefix": anom.response_data.get("response_body_prefix"),
     }
 
-    baseline_info = ""
-    base_time = anom.response_data.get("base_time")
-    if base_time:
-        baseline_info = (
-            f"基线响应时间: {base_time:.0f}ms, "
-            f"变异响应时间: {anom.response_time_ms:.0f}ms"
-        )
+    original_response = {
+        "status_code": anom.response_data.get("baseline_status_code"),
+        "response_time_ms": anom.response_data.get("baseline_response_time_ms"),
+        "error": anom.response_data.get("baseline_error"),
+    }
 
     return jsonify({
         "task_id": task_id,
@@ -503,8 +532,22 @@ def get_anomaly_detail(task_id, index):
             "headers": mutated_req.get("headers", {}),
             "body": mutated_req.get("body", ""),
         },
-        "response_summary": response_summary,
-        "baseline_comparison": baseline_info,
+        "original_response": original_response,
+        "mutated_response": mutated_response,
+        "response_comparison": {
+            "status_code": {
+                "original": original_response["status_code"],
+                "mutated": mutated_response["status_code"],
+            },
+            "response_time_ms": {
+                "original": original_response["response_time_ms"],
+                "mutated": mutated_response["response_time_ms"],
+            },
+            "error": {
+                "original": original_response["error"],
+                "mutated": mutated_response["error"],
+            },
+        },
         "reproduction": {
             "curl": _anomaly_to_curl(anom),
         },
@@ -601,7 +644,7 @@ def save_anomalies(task_id):
             "curl_text": curl_text,
         })
     elif format == "pytest":
-        pytest_text = format_pytest_script(test_cases)
+        pytest_text = format_pytest_script(test_cases, task)
         return jsonify({
             "task_id": task.task_id,
             "total_anomalies": len(task.anomalies),
@@ -624,7 +667,15 @@ def save_anomalies(task_id):
 
 @api.route("/api/fuzz/tasks", methods=["GET"])
 def list_all_tasks():
-    return jsonify(list_tasks())
+    tasks = _list_tasks()
+    for t in tasks:
+        task_obj = get_task(t["task_id"])
+        if task_obj:
+            t["has_live_thread"] = bool(
+                task_obj._thread and task_obj._thread.is_alive()
+            )
+            t["run_generation"] = task_obj.run_generation
+    return jsonify(tasks)
 
 
 @api.route("/api/fuzz/tasks/<task_id>/cancel", methods=["POST"])

@@ -71,6 +71,7 @@ class FuzzTask:
     report: dict = field(default_factory=dict)
     baseline: dict | None = None
     dedup_skipped: int = 0
+    run_generation: int = 1
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     _thread: threading.Thread | None = field(default=None, repr=False)
